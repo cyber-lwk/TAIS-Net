@@ -68,7 +68,13 @@ python train.py \
 #### Test
 
 ```bash
-python test.py --in_path YOUR_PATH_TO_LR_SEQS --out_path YOUR_OUTPUT_PATH --num_inference_steps 50 --controlnet_ckpt YOUR_PATH_TO_CONTROLNET_CKPT_FOLDER 
+python test.py --in_path datasets/sub_vsdrone/visdroneVSR/val/BDx4 \
+--gt_path datasets/sub_vsdrone/visdroneVSR/val/GT   \
+--out_path "TAISNet_visdroneVSR_val/"    \
+--controlnet_ckpt YOUR_PATH_TO_CONTROLNET_CKPT_FOLDER   \  
+--unet_ckpt YOUR_PATH_TO_UNet_CKPT_FOLDER   \
+--vaedecoder_ckpt YOUR_PATH_TO_VAE_CKPT_FOLDER     \
+--xstartreview_ckpt  YOUR_PATH_TO_HSGM_CKPT_FOLDER
 ```
 
 
