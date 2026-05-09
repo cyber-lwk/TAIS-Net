@@ -13,7 +13,7 @@ Emerging applications urgently require UAV videos with high clarity and rich str
 
 ### Method
 
-<img width="5159" height="3614" alt="overview" src="https://github.com/user-attachments/assets/155e7ac3-ffae-4e27-87c6-3602fdfbcff2" />
+![overview](assets/overview.png)
 
 ---
 
@@ -42,7 +42,7 @@ pip install -r requirements.txt
 #### Datasets
 
 Download the datasets from [here](https://pan.baidu.com/s/1SGodEizmznK_bsiDnXX_JA?pwd=0430)
-<img width="1993" height="1066" alt="dataset_demo" src="https://github.com/user-attachments/assets/06c6faf2-a1b6-41ab-aa8e-3f706307d7ea" />
+![dataset](assets/dataset_demo.png)
 
 
 
