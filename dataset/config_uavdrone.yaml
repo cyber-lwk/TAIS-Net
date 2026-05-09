@@ -1,0 +1,34 @@
+dataset:
+  train:
+    dataroot_gt: data/sub_vsdrone/uavVSR/train/GT/ # path to GT (e.g., 000, 001, 002 ... )
+    dataroot_lq: data/sub_vsdrone/uavVSR/train/BIx4/ # path to bicubic (e.g., 000, 001, 002 ... )
+    meta_info_file: data/sub_vsdrone/uavVSR/train/meta_info_VisDrone_train.txt
+    dataroot_flow:
+    io_backend:
+      type: disk
+    num_frame: 3
+    val_partition: 'REDS4'
+    test_mode: False
+    interval_list: [1]
+    random_reverse: False
+    gt_size: 256
+    use_hflip: True
+    use_rot: False
+    scale: 4
+    remove_partition: True
+  test:
+    dataroot_gt: data/sub_vsdrone/uavVSR/val/GT/
+    dataroot_lq: data/sub_vsdrone/uavVSR/val/BIx4/
+    meta_info_file: data/sub_vsdrone/uavVSR/val/meta_info_VisDrone_val.txt
+    io_backend:
+      type: disk
+    num_frame: 3
+    val_partition: 'REDS4'
+    test_mode: True
+    interval_list: [1]
+    random_reverse: False
+    gt_size: 256
+    use_hflip: False
+    use_rot: False
+    scale: 4
+    remove_partition: False
