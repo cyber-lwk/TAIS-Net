@@ -15,7 +15,8 @@
 
 import warnings
 warnings.filterwarnings("ignore")
-
+import torchvision
+import cv2
 import argparse
 import logging
 import math
@@ -24,7 +25,9 @@ import random
 import shutil
 from pathlib import Path
 from omegaconf import OmegaConf
-from dataset.reds_dataset import REDSRecurrentDataset
+# from dataset.reds_dataset import REDSRecurrentDataset
+from dataset.uavdrone_dataset import UAVDroneRecurrentDataset as REDSRecurrentDataset
+# from dataset.visdrone_dataset import VISDroneRecurrentDataset as REDSRecurrentDataset
 
 import accelerate
 import numpy as np
@@ -51,7 +54,8 @@ from diffusers import (
     ControlNetModel,
     UNet2DConditionModel
 )
-
+from diffusers.models.autoencoder_kl import AutoencoderKLIND
+from diffusers.models.unet_2d_condition import UNet2DMultiScaleConditionModel
 from pipeline.stablevsr_pipeline import StableVSRPipeline
 from diffusers.optimization import get_scheduler
 from diffusers.utils import check_min_version
@@ -69,7 +73,10 @@ import pyiqa
 from DISTS_pytorch import DISTS
 from torchvision.models.optical_flow import raft_large as raft
 from torchvision.transforms import ToTensor, CenterCrop
-
+# from diffusers.modules.SamplesReview import XStartReview
+# from diffusers.modules.SamplesReview import XStartReviewDF as XStartReview
+from diffusers.modules.SamplesReview import XStartReviewCrossFFT as XStartReview
+# from diffusers.modules.SamplesReview import XStartReviewCrossFreq as XStartReview
 best_psnr = 0
 best_lpips = 1e6
 
@@ -92,10 +99,24 @@ def center_crop(im, size=128):
     right = (width + size)/2
     bottom = (height + size)/2
     return im.crop((left, top, right, bottom))
+def center_crop_tensor(im, size=128):
+    width, height,_ = im.shape   # Get dimensions
+    left = int((width - size)/2)
+    top = int((height - size)/2)
+    right = int((width + size)/2)
+    bottom = int((height + size)/2)
+    return im[left:right, top:bottom,:]
 
-#打印验证过程中的性能测试
-def log_validation(vae, text_encoder, tokenizer, unet, controlnet, args, accelerator, weight_dtype, step, of_model):
+from basicsr.utils import FileClient, get_root_logger, imfrombytes, img2tensor
+import torchvision
+import cv2
+
+
+noise = torch.randn((1, 4, 64, 64))
+def log_validation(vae,noise_scheduler, encoder_hidden_states, unet, xstartreview, args, accelerator, weight_dtype, step, of_model):
     logger.info("Running validation... ")  # 正在执行验证操作
+    logger_file = get_root_logger(logger_name=__file__, log_file=os.path.join(args.output_dir,f"train_log.txt"))
+
     lpips = LPIPS(normalize=True)
     dists = DISTS()
     psnr = PSNR(data_range=1)
@@ -110,213 +131,304 @@ def log_validation(vae, text_encoder, tokenizer, unet, controlnet, args, acceler
     psnr = psnr.to(accelerator.device)
     ssim = ssim.to(accelerator.device)                            #正在执行验证操作
 
-    #control net 利用 accelerator 解包 还原成原始的模型
-    controlnet = accelerator.unwrap_model(controlnet)                  #
+    noise_scheduler.set_timesteps(20)  # 设置时间步
+    timesteps = noise_scheduler.timesteps
+    latents_pred_prev_store = []
+    validation_images = args.validation_image[0]
+    frames = validation_images.split(';')
+    # 读取视频帧并进行中心裁切操作
+    gt_frames = []
+    lq_frames = []
+    for i, frame in enumerate(frames):
+        if not os.path.exists(frame):
+            continue
+        images_times = []
+        seq, name = str(frame).split("/")[-2:]
+        img = cv2.imread(frame)
+        img = img.astype(np.float32) / 255.
+        # img_tensor = img_tensor(img, bgr2rgb=True)      #rgb 格式
+        if args.gt_size is not None:
+            img = center_crop_tensor(img, size=args.gt_size//4)
+        img = np.array(img)
+        # img = img.astype(np.float32) / 255.
+        img_tensor = img2tensor(img, bgr2rgb=True)  # rgb 格式
 
-    #定义StableVSR的模型pipeline
-    pipeline = StableVSRPipeline.from_pretrained(
-        args.pretrained_model_name_or_path,
-        vae=vae,
-        text_encoder=text_encoder,
-        tokenizer=tokenizer,
-        unet=unet,
-        controlnet=controlnet,
-        safety_checker=None,
-        revision=args.revision,
-        torch_dtype=weight_dtype,
-    )
+        lq_frames.append(img_tensor)
 
-    pipeline = pipeline.to(accelerator.device)                        #注册StableVsr模型
-    # pipeline.set_progress_bar_config(disable=True)
+        gt_dir = args.gt_path
+        # lq_dir = os.path.join(os.path.dirname(os.path.dirname(os.path.dirname(frame))), "val_sharp_bicubic/X4")
+        gt_filename = os.path.join(gt_dir, seq, name)
+        img = cv2.imread(gt_filename)
+        img = img.astype(np.float32) / 255.
+        # img_tensor = img_tensor(img, bgr2rgb=True)      #rgb 格式
+        if args.gt_size is not None:
+            img = center_crop_tensor(img, size=args.gt_size)
+        img = np.array(img)
+        # img = img.astype(np.float32) / 255.
+        img_tensor_lq = img2tensor(img, bgr2rgb=True)  # rgb 格式
+        gt_frames.append(img_tensor_lq)
+        # Sample noise that we'll add to the latents
+        # 为隐空间的图像添加噪声，模拟扩散过程。
 
-    if args.enable_xformers_memory_efficient_attention:               #是否使用xformers机制 使用xformers可以降低显存使用加快生成速度，但是细节上可能会有不同 按需采用
-        pipeline.enable_xformers_memory_efficient_attention()
+    lpips_dict_ori = []
+    psnr_dict_ori = []
+    ssim_dict_ori = []
+    dists_dict_ori = []
+    musiq_dict_ori = []
+    niqe_dict_ori = []
+    clip_dict_ori = []
+    tlpips_dict_ori = []
+    tof_dict_ori = []
 
-    if args.seed is None:
-        generator = None
-    else:
-        generator = torch.Generator(device=accelerator.device).manual_seed(args.seed)               #设置随机种子
-    #验证的图像与提示数目一致，如果不一致进行扩充
-    if len(args.validation_image) == len(args.validation_prompt):
-        validation_images = args.validation_image
-        validation_prompts = args.validation_prompt
-    elif len(args.validation_image) == 1:
-        validation_images = args.validation_image * len(args.validation_prompt)
-        validation_prompts = args.validation_prompt
-    elif len(args.validation_prompt) == 1:
-        validation_images = args.validation_image
-        validation_prompts = args.validation_prompt * len(args.validation_image)
-    else:
-        raise ValueError(
-            "number of `args.validation_image` and `args.validation_prompt` should be checked in `parse_args`"
-        )
+    lpips_dict_new = []
+    psnr_dict_new = []
+    ssim_dict_new = []
+    dists_dict_new = []
+    musiq_dict_new = []
+    niqe_dict_new = []
+    clip_dict_new = []
+    tlpips_dict_new = []
+    tof_dict_new = []
 
-    image_logs = []
-    #将提示与图像编码成一一对应
-    for validation_prompt, validation_image in zip(validation_prompts, validation_images):
-        frames = validation_image.split(';')
-        # 读取视频帧并进行中心裁切操作
-        gt_frames = []
-        for i, frame in enumerate(frames):
-            seq,name = str(frame).split("/")[-2:]
-            gt_path = os.path.join(args.gt_path,seq,name)
-            frame = Image.open(frame).convert("RGB")  # 转成RGB格式
-            frame = center_crop(frame, size=args.gt_size//4)
+    tt = ToTensor()
+    unet.eval()
+    with torch.no_grad():
+        for idx_f,(gt_img,lq_img) in tqdm(enumerate(zip(gt_frames,lq_frames))):
+            x0_prev_historys=[]
+            gt_tensor = gt_img.unsqueeze(0).to(accelerator.device)
+            lq_tensor = lq_img.unsqueeze(0).to(accelerator.device)
+            gt = 2 * gt_tensor - 1
+            lq = 2 * lq_tensor - 1
+            b, t, _, _ = lq_tensor.shape
 
-            gt_frame = Image.open(gt_path).convert("RGB")  # 转成RGB格式
-            gt_frame = center_crop(gt_frame, size=args.gt_size)
-            gt_frames.append(gt_frame)
-            # width, height = frame.size  # Get dimensions
-            # lq_width, lq_height = 64, 64
-            # left = (width - lq_width) / 2
-            # top = (height - lq_height) / 2
-            # right = (width + lq_width) / 2
-            # bottom = (height + lq_height) / 2
-            # frame = frame.crop((left, top, right, bottom))  # 中心裁切成 lq 大小
+            # Convert images to latent space
+            # 将高质量图像和前一帧图像编码到隐空间。 1 3 256 256
+            latents = vae.encode(gt.to(dtype=weight_dtype)).latent_dist.sample()
+            latents = latents * vae.config.scaling_factor
+            global noise
+            noise = noise.to(accelerator.device)
+            # noise = torch.randn_like(latents).to(accelerator.device)  # 真值参考的噪声
+            img = noise.clone().to(accelerator.device)
+            img_2 = img.clone().to(accelerator.device)
+            for tt in tqdm(timesteps):
+                bsz = latents.shape[0]
+                timestep = tt.expand((bsz,)).to(latents.device)
+                # if tt > 1:
+                #     noisy_latents_step = noise_scheduler.add_noise(latents, noise, timestep - 1)
+                # else:
+                #     noisy_latents_step = latents
 
-            frames[i] = frame
+                noisy_latents_cat1 = torch.cat([img, lq], dim=1)  # 去噪的输入条件
+                noisy_latents_cat2 = torch.cat([img_2, lq], dim=1)  # 去噪的输入条件
+                # Get the text embedding for conditioning
+                # tokenization = tokenizer('', max_length=tokenizer.model_max_length, padding="max_length", truncation=True, return_tensors="pt")
+                # encoder_hidden_states = text_encoder(tokenization)[0]
+                #获取真值
+                noisy_latents = noise_scheduler.add_noise(latents, noise, timestep)
+                target = noise_scheduler.get_velocity(latents, noise, timestep)
 
-            # frame = Image.open(frame).convert("RGB")                    #转成RGB格式
-            # width, height = frame.size   # Get dimensions
-            # lq_width, lq_height = 128, 128
-            # left = (width - lq_width)/2
-            # top = (height - lq_height)/2
-            # right = (width + lq_width)/2
-            # bottom = (height + lq_height)/2
-            # frame = frame.crop((left, top, right, bottom))              #中心裁切成 lq 大小
-            # frames[i] = frame
-        #执行验证阶段操作
-        for _ in range(args.num_validation_images):
-            # with torch.autocast("cuda"):
-            image = pipeline(
-                validation_prompt, frames, num_inference_steps=2, generator=generator, of_model=of_model,
-                guidance_scale=0
-            ).images
-        images = [x[0] for x in image]
-        # validation_image = validation_image.resize((new_width*4, new_height*4), Image.BICUBIC) # <- perform upscaling for log
-        image_logs.append(
-            {"images": images}
-        )
-        lpips_dict = []
-        psnr_dict = []
-        ssim_dict = []
-        dists_dict = []
-        musiq_dict = []
-        niqe_dict = []
-        clip_dict = []
-        tlpips_dict = []
-        tof_dict = []
-        tt = ToTensor()
-
-        total = len(frames)
-        # for root, dirs, files in os.walk(gt_path):
-        #     total += len(files)
-
-        pbar = tqdm(total=total, ncols=100)
-        for i, (im_rec, im_gt) in enumerate(zip(images, gt_frames)):
-            with torch.no_grad():
-                # gt = Image.open(os.path.join(gt_path, seq, im_gt))
-                # rec = Image.open(os.path.join(rec_path, seq, im_rec))
-
-                gt = tt(im_gt).unsqueeze(0).to(accelerator.device)
-                rec = tt(im_rec).unsqueeze(0).to(accelerator.device)
-
-                psnr_value = psnr(gt, rec)
-                ssim_value = ssim(gt, rec)
-                lpips_value = lpips(gt, rec)
-                dists_value = dists(gt, rec)
-                musiq_value = musiq(rec)
-                niqe_value = niqe(rec)
-                clip_value = clip(rec)
-                if i > 0:
-                    tlpips_value = (lpips(gt, prev_gt) - lpips(rec, prev_rec)).abs()
-                    tlpips_dict.append(tlpips_value.item())
-                    tof_value = (get_flow(of_model, rec, prev_rec) - get_flow(of_model, gt, prev_gt)).abs().mean()
-                    tof_dict.append(tof_value.item())
-
-            psnr_dict.append(psnr_value.item())
-            ssim_dict.append(ssim_value.item())
-            lpips_dict.append(lpips_value.item())
-            dists_dict.append(dists_value.item())
-            musiq_dict.append(musiq_value.item())
-            niqe_dict.append(niqe_value.item())
-            clip_dict.append(clip_value.item())
-
-            prev_rec = rec
-            prev_gt = gt
-            pbar.update()
-
-        psnr_mean =np.mean(psnr_dict)
-        mean_ssim = np.mean(ssim_dict)
-        lpips_mean =np.mean(lpips_dict)
-        mean_dists = np.mean(dists_dict)
-        mean_musiq = np.mean(musiq_dict)
-        mean_clip = np.mean(clip_dict)
-        mean_niqe = np.mean(niqe_dict)
-        mean_tlpips = np.mean(tlpips_dict)
-        mean_tof = np.mean(tof_dict)
-        logger.info(
-            f'PSNR: {psnr_mean}, SSIM: {mean_ssim}, LPIPS: {lpips_mean}, DISTS: {mean_dists}, MUSIQ: {mean_musiq}, CLIP: {mean_clip}, NIQE: {mean_niqe}, tLPIPS: {mean_tlpips}, tOF: {mean_tof}')
+                latnet_targets = []
+                for idx, tt in enumerate(timestep):
+                    output_prev = noise_scheduler.step(target[[idx]], tt, noisy_latents)
+                    # 在这里更新 lantent
+                    latnet_pred_prev1, x0_est_pred1 = output_prev.prev_sample, output_prev.pred_original_sample
+                    # XStart_pred1_prevs.append(x0_est_pred1)
+                    latnet_targets.append(latnet_pred_prev1)
+                latnet_targets = torch.cat(latnet_targets)
 
 
-        #保存模型 最优模型
-        os.makedirs(os.path.join(args.output_dir,"Metric"),exist_ok=True)
-        global best_psnr,best_lpips
-        if psnr_mean>best_psnr:
-            best_psnr = psnr_mean
-            save_path = os.path.join(args.output_dir,"Metric", f"checkpoint-psnrbest")
-            accelerator.save_state(save_path)
-            logger.info(f"Saved state to {save_path}")
+                # 使用 U-Net 模型预测噪声残差。当前预测的
+                model_pred_1 = unet(
+                    noisy_latents_cat1,
+                    timestep,
+                    # class_labels = noise_level,
+                    encoder_hidden_states=encoder_hidden_states[:b].detach(),
+                    num_scales=1
+                ).sample  # 通过前一时刻的噪声输入预测前一时刻添加的噪声
+                if isinstance(model_pred_1,list):
+                    model_pred_1 = model_pred_1[-1]
 
-        if lpips_mean < best_lpips:
-            best_lpips = lpips_mean
-            save_path = os.path.join(args.output_dir,"Metric",  f"checkpoint-lpipsbest")
-            accelerator.save_state(save_path)
-            logger.info(f"Saved state to {save_path}")
+                # 使用 U-Net 模型预测噪声残差。当前预测的
+                model_pred_2 = unet(
+                    noisy_latents_cat2,
+                    timestep,
+                    # class_labels = noise_level,
+                    encoder_hidden_states=encoder_hidden_states[:b].detach(),
+                    num_scales=1
+                ).sample  # 通过前一时刻的噪声输入预测前一时刻添加的噪声
+                if isinstance(model_pred_2,list):
+                    model_pred_2 = model_pred_2[-1]
 
-        # save_path = os.path.join(args.output_dir, f"checkpoint-{global_step}")
-        # accelerator.save_state(save_path)
-        # logger.info(f"Saved state to {save_path}")
-
-
-        ccc=0
+                latnet_pred1_prevs = []
+                # XStart_pred1_prevs = []
+                for idx, tt in enumerate(timestep):
+                    output_prev = noise_scheduler.step(model_pred_1[[idx]], tt, img[[idx]])
+                    # 在这里更新 lantent
+                    latnet_pred_prev1, x0_est_pred1 = output_prev.prev_sample, output_prev.pred_original_sample
+                    # XStart_pred1_prevs.append(x0_est_pred1)
+                    latnet_pred1_prevs.append(latnet_pred_prev1)
+                latnet_pred1_prevs = torch.cat(latnet_pred1_prevs)
+                # XStart_pred1_prevs = torch.cat(XStart_pred1_prevs)
+                img = latnet_pred1_prevs                                            # 原始输入预测的上一步输出
 
 
 
-    #输出到可视化日志界面中
-    for tracker in accelerator.trackers:
-        if tracker.name == "tensorboard":
-            for log in image_logs:
-                images = log["images"]
+                latnet_pred2_prevs = []
+                XStart_pred2_prevs = []
+                for idx, tt in enumerate(timestep):
+                    output_prev = noise_scheduler.step(model_pred_2[[idx]], tt, img_2[[idx]])
+                    # 在这里更新 lantent
+                    latnet_pred_prev, x0_est_pred = output_prev.prev_sample, output_prev.pred_original_sample
+                    XStart_pred2_prevs.append(x0_est_pred)                  #预测的上一步的X0
+                    if len(x0_prev_historys) > 0:
+                        x0_prev_last = x0_prev_historys[-1]    #和最后一个做合并
+                        x0_merger= xstartreview(x0_est_pred,x0_prev_last,(timestep[idx-1],tt))
+                        output_prev_merge = noise_scheduler.step(model_pred_2[[idx]], tt, img_2[[idx]],x0_estmate=x0_merger)
+                        latnet_pred_merge, x0_est_merge = output_prev_merge.prev_sample, output_prev_merge.pred_original_sample
+                        latnet_pred2_prevs.append(latnet_pred_merge)
+                    else:
+                        latnet_pred2_prevs.append(latnet_pred_prev)
+                latnet_pred2_prevs = torch.cat(latnet_pred2_prevs)
+                XStart_pred2_prevs = torch.cat(XStart_pred2_prevs)      # 保存的是之前预测的结果 也可以保存优化之后的结果 暂时先保存原始结果吧
+                img_2 = latnet_pred2_prevs
 
-                formatted_images = []
+                x0_prev_historys.append(XStart_pred2_prevs)
 
-                for image in images:
-                    formatted_images.append(np.asarray(image))
 
-                formatted_images = np.concatenate(formatted_images, axis=1)
-                formatted_images = np.expand_dims(formatted_images, 0)
+                in_diff_ori = torch.abs(target - model_pred_1)  # 当前和之前的差值
+                in_diff_post = torch.abs(target - model_pred_2)  # 当前和之前的差值
+                GT_diff = torch.abs(latnet_targets - latnet_pred1_prevs)  # 当前和之前的差值
+                GT_diffPost = torch.abs(latnet_targets - latnet_pred2_prevs)  # 当前和之前的差值
 
-                tracker.writer.add_images("", formatted_images, step, dataformats="NHWC")
-        elif tracker.name == "wandb":
-            formatted_images = []
+                Post_diffPost = torch.abs(latnet_pred1_prevs - latnet_pred2_prevs)  # 当前和之前的差值
 
-            for log in image_logs:
-                images = log["images"]
-                validation_prompt = log["validation_prompt"]
-                validation_image = log["validation_image"]
+                # 四通道的数据  model_pred noisy_latents model_pred_post target
+                visual_images = [torch.cat([latents[[0], [t]], noisy_latents[[0], [t]],
+                                            model_pred_1[[0], [t]], target[[0], [t]], in_diff_ori[[0], [t]],
+                                            model_pred_2[[0], [t]], target[[0], [t]], in_diff_post[[0], [t]],
+                                            latnet_pred1_prevs[[0], [t]], latnet_targets[[0], [t]], GT_diff[[0], [t]],
+                                            latnet_pred2_prevs[[0], [t]], latnet_targets[[0], [t]], GT_diffPost[[0], [t]],
+                                            Post_diffPost[[0], [t]]]
+                ) for t in range(4)]
 
-                formatted_images.append(wandb.Image(validation_image, caption="Controlnet conditioning"))
+                grid_images = []
+                for visual in visual_images:
+                    visual = visual.unsqueeze(1)
+                    grid_image = torchvision.utils.make_grid(visual, normalize=True, nrow=30)
+                    grid_image = (grid_image.permute(1, 2, 0) * 255.0).cpu().contiguous().detach().numpy().astype(
+                        np.uint8)
+                    grid_image = cv2.applyColorMap(grid_image, cv2.COLORMAP_JET)
+                    grid_images.append(grid_image)
+                    cc = 0
+                grid_image = np.concatenate(grid_images, axis=0)
+                h, w, c = grid_image.shape
+                pad = np.zeros((20, w, c))
+                grid_image = np.concatenate([grid_image, pad], axis=0)
 
-                for image in images:
-                    image = wandb.Image(image, caption=validation_prompt)
-                    formatted_images.append(image)
+                # grid_image = np.pad(grid_image, ((10, 10), (2, 2)), mode='constant', constant_values=0)
+                images_times.append(grid_image)
+            image_save = np.concatenate(images_times, axis=0)
+            image_save = image_save.astype(np.uint8)
+            dir = os.path.join(args.output_dir, "images", "train")
+            os.makedirs(dir, exist_ok=True)
+            name = f"{idx_f:04d}_{step:04d}_latent.png"
+            cv2.imwrite(os.path.join(dir, name), image_save)
 
-            tracker.log({"validation": formatted_images})
-        else:
-            logger.warn(f"image logging not implemented for {tracker.name}")
+            img_rgb = vae.decode(img / vae.config.scaling_factor, return_dict=False,num_scales=1)[0]
+            img_2_rgb = vae.decode(img_2 / vae.config.scaling_factor, return_dict=False,num_scales=1)[0]
+            #处理多个输入情况
+            if isinstance(img_rgb,list):
+                img_rgb = img_rgb[-1]
+                img_2_rgb = img_2_rgb[-1]
 
-        return image_logs
+
+            img_rgb = (img_rgb / 2 + 0.5).clamp(0, 1)
+            img_2_rgb = (img_2_rgb / 2 + 0.5).clamp(0, 1)
+            gt = (gt / 2 + 0.5).clamp(0, 1)
+
+            #获取评价指标
+            psnr_value_ori = psnr(gt, img_rgb)
+            ssim_value_ori = ssim(gt, img_rgb)
+            lpips_value_ori = lpips(gt, img_rgb)
+            dists_value_ori = dists(gt, img_rgb)
+            musiq_value_ori = musiq(img_rgb)
+            niqe_value_ori = niqe(img_rgb)
+            clip_value_ori = clip(img_rgb)
+
+            psnr_dict_ori.append(psnr_value_ori.item())
+            ssim_dict_ori.append(ssim_value_ori.item())
+            lpips_dict_ori.append(lpips_value_ori.item())
+            dists_dict_ori.append(dists_value_ori.item())
+            musiq_dict_ori.append(musiq_value_ori.item())
+            niqe_dict_ori.append(niqe_value_ori.item())
+            clip_dict_ori.append(clip_value_ori.item())
+
+
+            psnr_value = psnr(gt, img_2_rgb)
+            ssim_value = ssim(gt, img_2_rgb)
+            lpips_value = lpips(gt, img_2_rgb)
+            dists_value = dists(gt, img_2_rgb)
+            musiq_value = musiq(img_2_rgb)
+            niqe_value = niqe(img_2_rgb)
+            clip_value = clip(img_2_rgb)
+
+            psnr_dict_new.append(psnr_value.item())
+            ssim_dict_new.append(ssim_value.item())
+            lpips_dict_new.append(lpips_value.item())
+            dists_dict_new.append(dists_value.item())
+            musiq_dict_new.append(musiq_value.item())
+            niqe_dict_new.append(niqe_value.item())
+            clip_dict_new.append(clip_value.item())
+
+
+    psnr_mean_ori =np.mean(psnr_dict_ori)
+    mean_ssim_ori = np.mean(ssim_dict_ori)
+    lpips_mean_ori =np.mean(lpips_dict_ori)
+    mean_dists_ori = np.mean(dists_dict_ori)
+    mean_musiq_ori = np.mean(musiq_dict_ori)
+    mean_clip_ori = np.mean(clip_dict_ori)
+    mean_niqe_ori = np.mean(niqe_dict_ori)
+    # mean_tlpips_ori = np.mean(tlpips_dict_ori)
+    # mean_tof_ori = np.mean(tof_dict_ori)
+
+    psnr_mean_new =np.mean(psnr_dict_new)
+    mean_ssim_new = np.mean(ssim_dict_new)
+    lpips_mean_new =np.mean(lpips_dict_new)
+    mean_dists_new = np.mean(dists_dict_new)
+    mean_musiq_new = np.mean(musiq_dict_new)
+    mean_clip_new = np.mean(clip_dict_new)
+    mean_niqe_new = np.mean(niqe_dict_new)
+    # mean_tlpips_new = np.mean(tlpips_dict_new)
+    # mean_tof_new = np.mean(tof_dict_new)
+
+    logger.info(
+        f'PSNR: {psnr_mean_ori}, SSIM: {mean_ssim_ori}, LPIPS: {lpips_mean_ori}, DISTS: {mean_dists_ori}, MUSIQ: {mean_musiq_ori}, '
+        f'CLIP: {mean_clip_ori}, NIQE: {mean_niqe_ori}\n'
+        f'PSNRNew: {psnr_mean_new}, SSIMNew: {mean_ssim_new}, LPIPSNew: {lpips_mean_new}, DISTSNew: {mean_dists_new}, MUSIQNew: {mean_musiq_new}, '
+        f'CLIPNew: {mean_clip_new}, NIQENew: {mean_niqe_new}\n')
+
+    logger_file.info(
+        f'PSNR: {psnr_mean_ori}, SSIM: {mean_ssim_ori}, LPIPS: {lpips_mean_ori}, DISTS: {mean_dists_ori}, MUSIQ: {mean_musiq_ori}, '
+        f'CLIP: {mean_clip_ori}, NIQE: {mean_niqe_ori}\n'
+        f'PSNRNew: {psnr_mean_new}, SSIMNew: {mean_ssim_new}, LPIPSNew: {lpips_mean_new}, DISTSNew: {mean_dists_new}, MUSIQNew: {mean_musiq_new}, '
+        f'CLIPNew: {mean_clip_new}, NIQENew: {mean_niqe_new}\n')    # unet.train()
+
+    os.makedirs(os.path.join(args.output_dir, "Metric"), exist_ok=True)
+    global best_psnr, best_lpips
+    if psnr_mean_new > best_psnr:
+        best_psnr = psnr_mean_new
+        save_path = os.path.join(args.output_dir, "Metric", f"checkpoint-psnrbest")
+        accelerator.save_state(save_path)
+        logger.info(f"Step:{step} Saved state to {save_path}")
+        # bestpsnr_step = step
+    if lpips_mean_new > best_lpips:
+        best_lpips = lpips_mean_new
+        save_path = os.path.join(args.output_dir, "Metric", f"checkpoint-lpipsbest")
+        accelerator.save_state(save_path)
+        logger.info(f"Step:{step} Saved state to {save_path}")
+        # bestpsnr_step = step
+
+
 
 
 def import_model_class_from_model_name_or_path(pretrained_model_name_or_path: str, revision: str):
@@ -400,6 +512,20 @@ def parse_args(input_args=None):
         " If not specified controlnet weights are initialized from unet.",
     )
     parser.add_argument(
+        "--vaedecoder_ckpt",
+        type=str,
+        default=None,
+        help="Path to pretrained controlnet model or model identifier from huggingface.co/models."
+        " If not specified controlnet weights are initialized from unet.",
+    )
+    parser.add_argument(
+        "--unet_ckpt",
+        type=str,
+        default=None,
+        help="Path to pretrained controlnet model or model identifier from huggingface.co/models."
+        " If not specified controlnet weights are initialized from unet.",
+    )
+    parser.add_argument(
         "--revision",
         type=str,
         default=None,
@@ -462,7 +588,7 @@ def parse_args(input_args=None):
     parser.add_argument(
         "--checkpoints_total_limit",
         type=int,
-        default=None,
+        default=3,
         help=("Max number of checkpoints to store."),
     )
     parser.add_argument(
@@ -766,7 +892,6 @@ def collate_fn(examples):
         "input_ids": input_ids,
     }
 
-
 def main(args):
     logging_dir = Path(args.output_dir, args.logging_dir)
 
@@ -807,6 +932,9 @@ def main(args):
                 repo_id=args.hub_model_id or Path(args.output_dir).name, exist_ok=True, token=args.hub_token
             ).repo_id
 
+    #XStartReview网络
+    xstartreview = XStartReview()
+
     # Load the tokenizer
     if args.tokenizer_name:
         tokenizer = AutoTokenizer.from_pretrained(args.tokenizer_name, revision=args.revision, use_fast=False)
@@ -826,17 +954,22 @@ def main(args):
         args.pretrained_model_name_or_path, subfolder="text_encoder", revision=args.revision
     )
 
-    vae = AutoencoderKL.from_pretrained(args.pretrained_vae_model_name_or_path, subfolder="vae", revision=args.revision)
-    unet = UNet2DConditionModel.from_pretrained(
-        args.pretrained_model_name_or_path, subfolder="unet", revision=args.revision
+    # vae = AutoencoderKL.from_pretrained(args.pretrained_vae_model_name_or_path, subfolder="vae", revision=args.revision)
+    # unet = UNet2DConditionModel.from_pretrained(
+    #     args.pretrained_model_name_or_path, subfolder="unet", revision=args.revision
+    # )
+
+    vae = AutoencoderKLIND.from_pretrained(args.vaedecoder_ckpt, subfolder="vae", revision=args.revision)
+    unet = UNet2DMultiScaleConditionModel.from_pretrained(
+        args.unet_ckpt, subfolder="unet", revision=args.revision
     )
 
-    if args.controlnet_model_name_or_path:
-        logger.info("Loading existing controlnet weights")
-        controlnet = ControlNetModel.from_pretrained(args.controlnet_model_name_or_path)
-    else:
-        logger.info("Initializing controlnet weights from unet")
-        controlnet = ControlNetModel.from_unet(unet, conditioning_embedding_out_channels=(64,128,256,)) 
+    # if args.controlnet_model_name_or_path:
+    #     logger.info("Loading existing controlnet weights")
+    #     controlnet = ControlNetModel.from_pretrained(args.controlnet_model_name_or_path)
+    # else:
+    #     logger.info("Initializing controlnet weights from unet")
+    #     controlnet = ControlNetModel.from_unet(unet, conditioning_embedding_out_channels=(64,128,256,))
 
     # `accelerate` 0.16.0 will have better support for customized saving
     if version.parse(accelerate.__version__) >= version.parse("0.16.0"):
@@ -848,7 +981,7 @@ def main(args):
                 weights.pop()
                 model = models[i]
 
-                sub_dir = "controlnet"
+                sub_dir = "XStartReview"
                 model.save_pretrained(os.path.join(output_dir, sub_dir))
 
                 i -= 1
@@ -859,7 +992,7 @@ def main(args):
                 model = models.pop()
 
                 # load diffusers style into model
-                load_model = ControlNetModel.from_pretrained(input_dir, subfolder="controlnet")
+                load_model = xstartreview.from_pretrained(input_dir, subfolder="XStartReview")
                 model.register_to_config(**load_model.config)
 
                 model.load_state_dict(load_model.state_dict())
@@ -873,7 +1006,7 @@ def main(args):
     vae.requires_grad_(False)
     unet.requires_grad_(False)
     text_encoder.requires_grad_(False)
-    controlnet.train()
+    xstartreview.train()
     #是否使用 xformer 加快运行效率，减小内存占用 但是会降低质量的一致性
     if args.enable_xformers_memory_efficient_attention:
         if is_xformers_available():
@@ -885,12 +1018,12 @@ def main(args):
                     "xFormers 0.0.16 cannot be used for training in some GPUs. If you observe problems during training, please update xFormers to at least 0.0.17. See https://huggingface.co/docs/diffusers/main/en/optimization/xformers for more details."
                 )
             unet.enable_xformers_memory_efficient_attention()
-            controlnet.enable_xformers_memory_efficient_attention()
+            xstartreview.enable_xformers_memory_efficient_attention()
         else:
             raise ValueError("xformers is not available. Make sure it is installed correctly")
     #梯度检查
     if args.gradient_checkpointing:
-        controlnet.enable_gradient_checkpointing()
+        xstartreview.enable_gradient_checkpointing()
 
     # Check that all trainable models are in full precision
     low_precision_error_string = (
@@ -898,9 +1031,9 @@ def main(args):
         " doing mixed precision training, copy of the weights should still be float32."
     )
 
-    if accelerator.unwrap_model(controlnet).dtype != torch.float32:
+    if accelerator.unwrap_model(xstartreview).dtype != torch.float32:
         raise ValueError(
-            f"Controlnet loaded as datatype {accelerator.unwrap_model(controlnet).dtype}. {low_precision_error_string}"
+            f"Controlnet loaded as datatype {accelerator.unwrap_model(xstartreview).dtype}. {low_precision_error_string}"
         )
 
     # Enable TF32 for faster training on Ampere GPUs,
@@ -927,7 +1060,7 @@ def main(args):
         optimizer_class = torch.optim.AdamW
 
     # Optimizer creation
-    params_to_optimize = controlnet.parameters()
+    params_to_optimize = xstartreview.parameters()
     optimizer = optimizer_class(
         params_to_optimize,
         lr=args.learning_rate,
@@ -967,8 +1100,8 @@ def main(args):
     )
 
     # Prepare everything with our `accelerator`.
-    controlnet, optimizer, train_dataloader, lr_scheduler = accelerator.prepare(
-        controlnet, optimizer, train_dataloader, lr_scheduler
+    xstartreview, optimizer, train_dataloader, lr_scheduler = accelerator.prepare(
+        xstartreview, optimizer, train_dataloader, lr_scheduler
     )
 
     # For mixed precision training we cast the text_encoder and vae weights to half-precision
@@ -1053,45 +1186,10 @@ def main(args):
         # Only show the progress bar once on each machine.
         disable=not accelerator.is_local_main_process,
     )
-    # ################################################################################
-    # # 测试学习率
-    # lr_list=[]
-    # from tqdm import trange
-    # for epoch in trange(first_epoch, args.num_train_epochs):
-    #     for step, batch in enumerate(tqdm(train_dataloader)):        #定义了训练的外层循环（遍历所有训练轮数）和内层循环（遍历每个批次的数据）。
-    #         # # 使用 accelerator.accumulate 上下文管理器，确保梯度累积在多个前向传播中进行，然后在执行一次反向传播。
-    #         # with accelerator.accumulate(controlnet):
-    #         #     # optimizer.step()
-    #         #     lr_scheduler.step()
-    #         #     # optimizer.zero_grad(set_to_none=args.set_grads_to_none)
-    #         #     lr = lr_scheduler.get_last_lr()[0]
-    #         #     lr_list.append(lr)
-    #         lr_scheduler.step()
-    #         # optimizer.zero_grad(set_to_none=args.set_grads_to_none)
-    #         lr = lr_scheduler.get_last_lr()[0]
-    #         lr_list.append(lr)
-    # # 可视化学习率
-    # import matplotlib.pyplot as plt
-    # # 绘制学习率曲线
-    # plt.figure(figsize=(10, 6))
-    # plt.plot(range(len(lr_list)), lr_list, marker='o', linestyle='-', color='b')
-    # plt.title('Learning Rate Scheduler')
-    # plt.xlabel('Epoch')
-    # plt.ylabel('Learning Rate')
-    # plt.grid(True)
-    # plt.show()
-    # ccc=0
-    # #################################################################################
-    #
-
-
 
     image_logs = None
 
-    # get here input condition since it is fixed
-    # 这段代码是一个深度学习训练循环的一部分，主要用于训练一个结合了 ControlNet 的扩散模型。
-    # 它涉及图像处理、文本编码、噪声调度、模型预测和损失计算等多个步骤。以下是对代码的详细解释：
-    # 在不计算梯度的情况下，对一批空字符串进行分词和文本编码，生成文本条件 encoder_hidden_states，用于后续的模型输入。
+
     with torch.no_grad():
         tokenization = tokenizer([''] * args.train_batch_size, max_length=tokenizer.model_max_length, padding="max_length", truncation=True, return_tensors="pt")
         encoder_hidden_states = text_encoder(tokenization.input_ids.to(accelerator.device))[0]
@@ -1099,113 +1197,108 @@ def main(args):
     for epoch in range(first_epoch, args.num_train_epochs):
         for step, batch in enumerate(train_dataloader):        #定义了训练的外层循环（遍历所有训练轮数）和内层循环（遍历每个批次的数据）。
             # 使用 accelerator.accumulate 上下文管理器，确保梯度累积在多个前向传播中进行，然后在执行一次反向传播。
-            with accelerator.accumulate(controlnet):
+            with accelerator.accumulate(xstartreview):
+                # inference_steps = random.randint(10,100)                #假设实际采样步数为10 - 100 步之间
+                inference_steps = random.choice([20,30,50])
+                noise_scheduler.set_timesteps(inference_steps)                #设置时间步
+                timesteps = noise_scheduler.timesteps                         #获取更新后的timesteps
+                #获取两个t
+                t_idx=random.randint(1,inference_steps-1)
+                time_prev=timesteps[t_idx]                                      #较小时刻
+                time_after = timesteps[t_idx-1]                                 #较大时刻
                 # Prepare images
                 lq = batch['lq'] 
                 gt = batch['gt']
                 gt = 2 * gt - 1
                 lq = 2 * lq - 1          # 从批次中提取低质量图像（lq）和高质量图像（gt），并将它们归一化到 [-1, 1] 范围内。
                 b, t, _, _, _ = lq.shape
-                # 对低质量图像进行上采样，使其分辨率与高质量图像一致。
-                upscaled_lq = rearrange(lq, 'b t c h w -> (b t) c h w')
-                upscaled_lq = F.interpolate(upscaled_lq, scale_factor=4, mode='bicubic')
-                upscaled_lq = rearrange(upscaled_lq, '(b t) c h w -> b t c h w', b=b, t=t)
-                # 随机选择时间步 t 的前一帧或后一帧，用于生成前一帧的图像。 注意：一个 batch 3 张 这里的t要么是0 要么是2
-                # 如果是0 则是前一帧 如果是2 则是后一帧
-                random_t = [round(random.random()) * 2 for _ in range(b)] # <- decide t-1 or t+1
-                gt_prev = torch.stack([gt[i, t] for i, t in enumerate(random_t)])
-                upscaled_lq_prev = torch.stack([upscaled_lq[i, t] for i, t in enumerate(random_t)])
-                lq_prev = torch.stack([lq[i, t] for i, t in enumerate(random_t)])
+
                 # 选择当前时间步的图像。 #中间帧
                 gt = gt[:, t // 2, ...]
                 lq = lq[:, t // 2, ...]
-                upscaled_lq_cur = upscaled_lq[:, t // 2, ...]
+                # upscaled_lq_cur = upscaled_lq[:, t // 2, ...]
 
                 # Convert images to latent space
                 # 将高质量图像和前一帧图像编码到隐空间。 1 3 256 256
-                latents = vae.encode(gt.to(dtype=weight_dtype)).latent_dist.sample()
+                latents = vae.encode(gt.to(dtype=weight_dtype)).latent_dist.sample()            # 10 4 64 64
                 latents = latents * vae.config.scaling_factor
-                latents_prev = vae.encode(gt_prev.to(dtype=weight_dtype)).latent_dist.sample()
-                latents_prev = latents_prev * vae.config.scaling_factor         # 1 4 64 64 latents是对GT进行编码得到的
 
-                # Sample noise that we'll add to the latents
-                # 为隐空间的图像添加噪声，模拟扩散过程。
-                noise = torch.randn_like(latents)                   #真值参考的噪声
-                bsz = latents.shape[0]
-                # Sample a random timestep for each image  随机获得时间步t
-                timesteps = torch.randint(0, noise_scheduler.config.num_train_timesteps, (bsz,), device=latents.device)
-                timesteps = timesteps.long()
-
+                #
+                time_afters = time_after.expand((b,)).to(accelerator.device)
+                noise = torch.randn_like(latents).to(accelerator.device)  # 真值参考的噪声
                 # Add noise to the latents according to the noise magnitude at each timestep
                 # (this is the forward diffusion process)   #前向加噪过程
-                noisy_latents = noise_scheduler.add_noise(latents, noise, timesteps)
-                # 真值的潜变量 与 低质量输入拼接 作为输入 妙啊，真值条件压缩四倍，正好与低分辨率输入大小一致
-                # 可以减小训练时的内存消耗
-                noisy_latents_cat = torch.cat([noisy_latents, lq], dim=1)    #去噪的输入条件
-                # Get the text embedding for conditioning
-                # tokenization = tokenizer('', max_length=tokenizer.model_max_length, padding="max_length", truncation=True, return_tensors="pt")
-                # encoder_hidden_states = text_encoder(tokenization)[0]
+                noisy_latents = noise_scheduler.add_noise(latents, noise, time_afters)
 
-
-                # make prediction of the previous frame
-                noise_prev = torch.randn_like(latents_prev)
-                noisy_latents_prev = noise_scheduler.add_noise(latents_prev, noise_prev, timesteps)
-                noisy_latents_prev_cat = torch.cat([noisy_latents_prev, lq_prev], dim=1)    #前一时刻的输入
-                # noise_level = torch.cat([torch.tensor([20], dtype=torch.long, device=accelerator.device)] * b)
-                # 使用 U-Net 模型预测噪声残差。
-                model_pred_prev = unet(
-                    noisy_latents_prev_cat,
-                    timesteps,
-                    # class_labels = noise_level,
-                    encoder_hidden_states=encoder_hidden_states.detach()
-                ).sample                # 通过前一时刻的噪声输入预测前一时刻添加的噪声
-                # 去噪的 前一时刻隐变量
-                approximated_x0_latent_prev = noise_scheduler.get_approximated_x0(model_pred_prev, timesteps, noisy_latents_prev)
-                # 对隐特征进行解码还原至原始空间得到前一时刻的图像
-                approximated_x0_rgb_prev = vae.decode(approximated_x0_latent_prev / vae.config.scaling_factor).sample
-
-                # latents_prev_warped = compute_of_and_warp(of_model, upscaled_lq_cur, upscaled_lq_prev, latents_prev)
-                # controlnet_image = latents_prev_warped.to(dtype=weight_dtype)
-                f_flow = get_flow(of_model, upscaled_lq_cur, upscaled_lq_prev)
-                warped_approximated_x0 = flow_warp(approximated_x0_rgb_prev, f_flow)
-                #利用 上采样之后的输入图像计算光流 并将扩散恢复的前一帧图像进行光流对齐 作为 controlnet_image
-                controlnet_image = warped_approximated_x0.to(dtype=weight_dtype).detach()
-                #利用 当前输入以及对齐之后的重建图像作为输入 通过 ControlNet 获得 时间上的特征残差
-                down_block_res_samples, mid_block_res_sample = controlnet(
+                noisy_latents_cat = torch.cat([noisy_latents, lq], dim=1)  # 去噪的输入条件
+                model_pred_prevtime = unet(
                     noisy_latents_cat,
-                    timesteps,
+                    time_afters,
                     # class_labels = noise_level,
-                    encoder_hidden_states=encoder_hidden_states.detach(),
-                    controlnet_cond=controlnet_image,
-                    return_dict=False,
-                )
-                
-                # Predict the noise residual
-                # 利用 当前时刻的输入 以及获得的时间上的特征残差进行预测当前时刻的噪声残差
-                model_pred = unet(
-                    noisy_latents_cat,
-                    timesteps,
+                    encoder_hidden_states=encoder_hidden_states[:b].detach(),
+                    num_scales=1,
+                ).sample  # 通过前一时刻的噪声输入预测前一时刻添加的噪声
+                if isinstance(model_pred_prevtime,list):
+                    model_pred_prevtime = model_pred_prevtime[-1]
+                latnet_pred_afters = []
+                x0_pred_afters = []
+                for idx, tt in enumerate(time_afters):
+                    output_prev = noise_scheduler.step(model_pred_prevtime[[idx]], tt, noisy_latents[[idx]])
+                    # 在这里更新 lantent
+                    latnet_pred_prev, x0_est_prev = output_prev.prev_sample, output_prev.pred_original_sample
+                    latnet_pred_afters.append(latnet_pred_prev)
+                    x0_pred_afters.append(x0_est_prev)
+                latnet_pred_afters = torch.cat(latnet_pred_afters).to(accelerator.device)
+                x0_pred_afters = torch.cat(x0_pred_afters).to(accelerator.device)
+                #后一个时刻
+                time_prevs = time_prev.expand((b,)).to(accelerator.device)
+                noisy_latents_aftercat = torch.cat([latnet_pred_afters, lq], dim=1)  # 去噪的输入条件
+                model_pred_prevtime = unet(
+                    noisy_latents_aftercat,
+                    time_prevs,
                     # class_labels = noise_level,
-                    encoder_hidden_states=encoder_hidden_states.detach(),
-                    down_block_additional_residuals=[
-                        sample.to(dtype=weight_dtype) for sample in down_block_res_samples
-                    ],
-                    mid_block_additional_residual=mid_block_res_sample.to(dtype=weight_dtype),
-                ).sample
-                # Get the target for loss depending on the prediction type  #默认是 epsilon 目标是残差 估计的是残差
-                if noise_scheduler.config.prediction_type == "epsilon":
-                    target = noise
-                elif noise_scheduler.config.prediction_type == "v_prediction":
-                    target = noise_scheduler.get_velocity(latents, noise, timesteps)
-                else:
-                    raise ValueError(f"Unknown prediction type {noise_scheduler.config.prediction_type}")
+                    encoder_hidden_states=encoder_hidden_states[:b].detach()
+                ).sample  # 通过前一时刻的噪声输入预测前一时刻添加的噪声
+                if isinstance(model_pred_prevtime,list):
+                    model_pred_prevtime = model_pred_prevtime[-1]
+                # latnet_pred_prevs = []
+                x0_pred_prevs = []
+                for idx, tt in enumerate(time_afters):
+                    output_prev = noise_scheduler.step(model_pred_prevtime[[idx]], tt, noisy_latents[[idx]])
+                    # 在这里更新 lantent
+                    latnet_pred_prev, x0_est_prev = output_prev.prev_sample, output_prev.pred_original_sample
+                    # latnet_pred_prevs.append(latnet_pred_prev)
+                    x0_pred_prevs.append(x0_est_prev)
+                # latnet_pred_prevs = torch.cat(latnet_pred_prevs)
+                x0_pred_prevs = torch.cat(x0_pred_prevs).to(accelerator.device)
+
+                x0_final = xstartreview(x0_pred_prevs,x0_pred_afters,(time_afters,time_prevs))
+                latent_denoises = []
+                for idx, tt in enumerate(time_afters):
+                    output_prev = noise_scheduler.step(model_pred_prevtime[[idx]], tt, noisy_latents[[idx]],x0_estmate=x0_final[[idx]])
+                    # 在这里更新 lantent
+                    latnet_pred_prev, x0_est_prev = output_prev.prev_sample, output_prev.pred_original_sample
+                    latent_denoises.append(latnet_pred_prev)
+                latent_denoises = torch.cat(latent_denoises).to(accelerator.device)
+
+                target = noise_scheduler.get_velocity(latents, noise, time_prevs)
+                noisy_latents = noise_scheduler.add_noise(latents, noise, time_prevs)
+                latnet_target_prevs = []
+                for idx, tt in enumerate(time_prevs):
+                    output_prev = noise_scheduler.step(target[[idx]], tt, noisy_latents[[idx]])
+                    # 在这里更新 lantent
+                    latnet_pred_prev, x0_est_prev = output_prev.prev_sample, output_prev.pred_original_sample
+                    latnet_target_prevs.append(latnet_pred_prev)
+                latnet_target_prevs = torch.cat(latnet_target_prevs).to(accelerator.device)
+
+                #OK latent_denoises latnet_target_prevs
 
                 # 计算预测值和目标值之间的均方误差损失。
-                loss = F.mse_loss(model_pred.float(), target.float(), reduction="mean")
+                loss = F.mse_loss(latent_denoises.float(), latnet_target_prevs.float(), reduction="mean")
                 # 执行反向传播，更新模型参数，并调整学习率。
                 accelerator.backward(loss)
                 if accelerator.sync_gradients:
-                    params_to_clip = controlnet.parameters()
+                    params_to_clip = xstartreview.parameters()
                     accelerator.clip_grad_norm_(params_to_clip, args.max_grad_norm)
                 optimizer.step()
                 lr_scheduler.step()
@@ -1241,14 +1334,14 @@ def main(args):
                         save_path = os.path.join(args.output_dir, f"checkpoint-{global_step}")
                         accelerator.save_state(save_path)
                         logger.info(f"Saved state to {save_path}")
-                    # 定期执行验证，并记录验证结果
+                    # # 定期执行验证，并记录验证结果
                     if args.validation_prompt is not None and global_step % args.validation_steps == 0:
                         image_logs = log_validation(
                             vae,
-                            text_encoder,
-                            tokenizer,
+                            noise_scheduler,
+                            encoder_hidden_states,
                             unet,
-                            controlnet,
+                            xstartreview,
                             args,
                             accelerator,
                             weight_dtype,
@@ -1266,7 +1359,7 @@ def main(args):
     # Create the pipeline using using the trained modules and save it.
     accelerator.wait_for_everyone()
     if accelerator.is_main_process:
-        controlnet = accelerator.unwrap_model(controlnet)
+        controlnet = accelerator.unwrap_model(xstartreview)
         controlnet.save_pretrained(args.output_dir)
 
         if args.push_to_hub:
