@@ -45,6 +45,9 @@ Download the datasets from [here](https://pan.baidu.com/s/1SGodEizmznK_bsiDnXX_J
 ![dataset](assets/dataset_demo.png)
 
 
+#### Pretrained models
+Pretrained models are available [here](https://pan.baidu.com/s/1UltMRhjnYPe2zmSKljS5hQ?pwd=0430). 
+
 
 #### Train
 
